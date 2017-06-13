@@ -43,27 +43,13 @@
 #include <magenta/assert.h>
 #include <sync/completion.h>
 
-// BCM28xx Specific Includes
-#include <bcm/bcm28xx.h>
-#include <bcm/ioctl.h>
-
-#define TRACE 0
-
-#if TRACE
-#define xprintf(fmt...) printf(fmt)
-#else
-#define xprintf(fmt...) \
-    do {                \
-    } while (0)
-#endif
-
 #define PAGE_MASK_4K (0xFFF)
 #define SDMMC_PAGE_START (EMMC_BASE & (~PAGE_MASK_4K))
 #define SDMMC_PAGE_SIZE (0x1000)
 
 #define SD_FREQ_SETUP_HZ  400000
 
-typedef struct emmc {
+typedef struct sdhci_device {
     // Interrupts mapped here.
     mx_handle_t irq_handle;
 
@@ -86,7 +72,7 @@ typedef struct emmc {
 
     // Cached base clock rate that the pi is running at.
     uint32_t base_clock;
-} emmc_t;
+} sdhci_device_t;
 
 typedef struct emmc_setup_context {
     mx_device_t* dev;
@@ -680,37 +666,60 @@ out:
     return -1;
 }
 
-static mx_status_t emmc_bind(void* drv_ctx, mx_device_t* dev, void** cookie) {
-    // Create a context to pass bind variables to the bootstrap thread.
-    emmc_setup_context_t* ctx = calloc(1, sizeof(*ctx));
-    if (!ctx)
-        return MX_ERR_NO_MEMORY;
-    ctx->dev = dev;
-
-    // Create a bootstrap thread.
-    thrd_t bootstrap_thrd;
-    int thrd_rc = thrd_create_with_name(&bootstrap_thrd,
-                                        emmc_bootstrap_thread, ctx,
-                                        "emmc_bootstrap_thread");
-    if (thrd_rc != thrd_success) {
-        free(ctx);
-        return thrd_status_to_mx_status(thrd_rc);
+static mx_status_t sdhci_bind(void* ctx, mx_device_t* parent, void** cookie) {
+    sd_host_protocol_t* sd;
+    if (device_op_get_protocol(parent, MX_PROTOCOL_SD_HOST, (void**)&sd)) {
+        return MX_ERR_NOT_SUPPORTED;
     }
 
-    thrd_detach(bootstrap_thrd);
+    sdhci_device_t* dev = calloc(1, sizeof(sdhci_device_t));
+    if (!dev) {
+        return MX_ERR_NO_MEMORY;
+    }
+
+    // Map the Device Registers so that we can perform MMIO against the device.
+    mx_status_t status = sd->get_mmio(parent, &dev->regs);
+    if (status != MX_OK) {
+        printf("sdhci: error %d in get_mmio\n", status);
+        goto fail;
+    }
+
+    dev->irq_handle = sd->get_interrupt(parent);
+    if (dev->irq_handle < 0) {
+        printf("sdhci: error %d in get_interrupt\n", status);
+        status = dev->irq_handle;
+        goto fail;
+    }
+
+    dev->irq_completion = COMPLETION_INIT;
+    dev->parent = parent;
+
+    // Ensure that we're SDv3 or above.
+    const uint16_t vrsn = (dev->regs->slotirqversion >> 16) & 0xff;
+    if (vrsn < SDHCI_VERSION_3) {
+        printf("sdhci: SD version is %u, only version %u and above are "
+                "supported\n", vrsn, SDHCI_VERSION_3);
+        status = MX_ERR_NOT_SUPPORTED;
+        goto fail;
+    }
+
+    dev->base_clock = sd->get_base_clock(parent);
     return MX_OK;
+fail:
+    if (dev) {
+        free(dev)
+    }
+    return status;
 }
 
-static mx_driver_ops_t emmc_dwc_driver_ops = {
+static mx_driver_ops_t sdhci_driver_ops = {
     .version = DRIVER_OPS_VERSION,
-    .bind = emmc_bind,
+    .bind = sdhci_bind,
 };
 
 // The formatter does not play nice with these macros.
 // clang-format off
-MAGENTA_DRIVER_BEGIN(bcm_emmc, emmc_dwc_driver_ops, "magenta", "0.1", 3)
-    BI_ABORT_IF(NE, BIND_PROTOCOL, MX_PROTOCOL_PLATFORM_DEV),
-    BI_ABORT_IF(NE, BIND_PLATFORM_DEV_VID, PDEV_VID_BROADCOMM),
-    BI_MATCH_IF(EQ, BIND_PLATFORM_DEV_DID, PDEV_DID_BROADCOMM_EMMC),
-MAGENTA_DRIVER_END(bcm_emmc)
+MAGENTA_DRIVER_BEGIN(sdhci, sdhci_driver_ops, "magenta", "0.1", 1)
+    BI_MATCH_IF(NE, BIND_PROTOCOL, MX_PROTOCOL_SD_HOST),
+MAGENTA_DRIVER_END(sdhci)
 // clang-format on
